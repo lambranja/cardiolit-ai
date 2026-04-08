@@ -7,6 +7,9 @@ suppressPackageStartupMessages({
   library(purrr); library(stringr); library(tidyr); library(openxlsx)
   library(glue); library(tibble); library(shiny); library(shinythemes); library(shinyjs)
 })
+MODEL_TRIAGE  <- "@OpenAI/gpt-5.4"
+MODEL_EXTRACT <- "@OpenAI/gpt-5.4"
+OPENAI_BASE   <- "https://api.portkey.ai/v1/chat/completions"
 
 MODEL_NAME  <- "gpt-5.4"
 OPENAI_BASE <- "https://api.portkey.ai/v1/chat/completions"
