@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN R -e "install.packages(c( \
-  'shiny','httr','jsonlite','xml2','dplyr','purrr','stringr','tidyr', \
+  'shiny','httr2','jsonlite','xml2','dplyr','purrr','stringr','tidyr', \
   'openxlsx','glue','tibble','shinythemes','shinyjs' \
 ), repos='https://cloud.r-project.org')"
 
