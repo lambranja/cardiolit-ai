@@ -12,6 +12,8 @@ MODEL_NAME  <- "gpt-5.4"
 OPENAI_BASE <- "https://api.portkey.ai/v1/chat/completions"
 
 openai_request <- function(messages, response_format = NULL) {
+  message("PORTKEY_API_KEY empty? ", Sys.getenv("PORTKEY_API_KEY") == "")
+  
   req_body <- list(
     model = MODEL_NAME,
     messages = messages,
