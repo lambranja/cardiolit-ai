@@ -26,11 +26,11 @@ openai_request <- function(messages, model, response_format = NULL) {
   }
 
   res <- request(OPENAI_BASE) |>
-    req_headers(
-      "x-portkey-api-key"     = Sys.getenv("PORTKEY_API_KEY"),
-      "x-portkey-virtual-key" = Sys.getenv("PORTKEY_VIRTUAL_KEY"),
-      "Content-Type"          = "application/json"
-    ) |>
+  req_headers(
+  "x-portkey-api-key" = Sys.getenv("PORTKEY_API_KEY"),
+  "x-portkey-provider" = "@Anthropic2",   # veya doğru provider
+  "Content-Type" = "application/json"
+) |>
     req_body_json(req_body) |>
     req_retry(max_tries = 3) |>
     req_perform() |>
