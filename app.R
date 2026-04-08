@@ -8,20 +8,20 @@ suppressPackageStartupMessages({
   library(glue); library(tibble); library(shiny); library(shinythemes); library(shinyjs)
 })
 
-# ==============================================================================
-# 2. CONFIG & HELPERS
-# ==============================================================================
-openai_request <- function(messages, model, response_format = NULL) {
+MODEL_NAME  <- "gpt-5.4"
+OPENAI_BASE <- "https://api.portkey.ai/v1/chat/completions"
+
+openai_request <- function(messages, response_format = NULL) {
   req_body <- list(
-    model = model,
+    model = MODEL_NAME,
     messages = messages,
     temperature = 0
   )
-  
+
   if (!is.null(response_format)) {
     req_body$response_format <- response_format
   }
-  
+
   res <- request(OPENAI_BASE) |>
     req_headers(
       "Content-Type" = "application/json",
@@ -33,21 +33,20 @@ openai_request <- function(messages, model, response_format = NULL) {
     req_retry(max_tries = 3) |>
     req_perform() |>
     resp_body_json()
-  
+
   if (is.null(res$choices) || length(res$choices) == 0 ||
       is.null(res$choices[[1]]$message$content)) {
     stop("No valid choices returned from the model.")
   }
-  
+
   res$choices[[1]]$message$content
 }
 
-ask_json <- function(prompt, schema, model) {
+ask_json <- function(prompt, schema) {
   txt <- openai_request(
     list(list(role = "user", content = prompt)),
-    model,
     response_format = list(
-      type        = "json_schema",
+      type = "json_schema",
       json_schema = list(name = "schema", schema = schema)
     )
   )
@@ -290,7 +289,7 @@ server <- function(input, output, session) {
         # ------------------------------------------------------------------
         incProgress(0.10, detail = "Formulating PubMed Query...")
         q_prompt <- build_query_prompt(input$q, input$query_mode)
-        q_raw    <- openai_request(list(list(role = "user", content = q_prompt)), MODEL_TRIAGE)
+        q_raw <- openai_request(list(list(role = "user", content = q_prompt)))
         q_final  <- paste0("(", trimws(q_raw), ") AND hasabstract[text] NOT \"case reports\"[PT]")
         
         # ------------------------------------------------------------------
@@ -387,7 +386,7 @@ OUTPUT (JSON ONLY)
 }}
 ")
           
-          t_res <- ask_json(prompt, triage_schema, MODEL_TRIAGE)
+          t_res <- ask_json(prompt, triage_schema)
           
           rel  <- t_res$level
           reas <- t_res$reason
@@ -511,7 +510,7 @@ OUTPUT FORMAT (JSON ONLY)
 }}
 ")
             
-            e_res <- ask_json(e_prompt, extract_schema, MODEL_EXTRACT)
+            e_res <- ask_json(e_prompt, extract_schema)
             
             row <- eligible_df[j, ]
             for (oc in outcomes_list) {
@@ -583,5 +582,12 @@ OUTPUT FORMAT (JSON ONLY)
   )
 }
 
-shinyApp(ui, server)
+shinyApp(
+  ui,
+  server,
+  options = list(
+    host = "0.0.0.0",
+    port = as.numeric(Sys.getenv("PORT", 3838))
+  )
+)
 
