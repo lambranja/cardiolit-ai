@@ -80,16 +80,21 @@ openai_request <- function(messages, model = DEFAULT_MODEL) {
 }
 
 ask_json <- function(prompt, model = DEFAULT_MODEL) {
+
   txt <- openai_request(
-    list(list(role = "user", content = paste(prompt, "\nReturn ONLY valid JSON."))),
+    list(list(role = "user", content = paste(prompt, "\nReturn ONLY valid JSON. No explanation."))),
     model = model
   )
 
-  txt <- gsub("^```json\\s*|\\s*```$", "", txt)
-  txt <- trimws(txt)
+  # 🔥 JSON extract (çok kritik)
+  json_txt <- stringr::str_extract(txt, "\\{.*\\}")
+
+  if (is.na(json_txt)) {
+    return(list(level = "RED", reason = "no_json_returned", n = 0))
+  }
 
   tryCatch(
-    fromJSON(txt, simplifyVector = FALSE),
+    fromJSON(json_txt, simplifyVector = FALSE),
     error = function(e) {
       list(level = "RED", reason = "parse_error", n = 0)
     }
