@@ -3,364 +3,608 @@
 # ==============================================================================
 
 suppressPackageStartupMessages({
-  library(httr)
-  library(jsonlite)
-  library(xml2)
-  library(dplyr)
-  library(purrr)
-  library(stringr)
-  library(tidyr)
-  library(openxlsx)
-  library(glue)
-  library(tibble)
-  library(shiny)
-  library(shinythemes)
-  library(shinyjs)
+  library(httr2); library(jsonlite); library(xml2); library(dplyr)
+  library(purrr); library(stringr); library(tidyr); library(openxlsx)
+  library(glue); library(tibble); library(shiny); library(shinythemes); library(shinyjs)
 })
 
 # ==============================================================================
-# 2. HELPERS
+# 2. CONFIG & HELPERS
 # ==============================================================================
+MODEL_TRIAGE  <- "gpt-5.4"
+MODEL_EXTRACT <- "gpt-5.4"
+OPENAI_BASE <- "https://api.portkey.ai/v1/chat/completions"
 
-`%||%` <- function(a, b) if (!is.null(a)) a else b
 
-sanitize_colname <- function(x) {
-  x %>%
-    tolower() %>%
-    str_replace_all("[^a-z0-9]", "_")
-}
+openai_request <- function(messages, model, response_format = NULL) {
 
-# ==============================================================================
-# 3. CONFIG
-# ==============================================================================
-
-PORTKEY_URL <- "https://api.portkey.ai/v1/chat/completions"
-DEFAULT_MODEL <- "claude-sonnet-4-5-20250929"
-
-# ==============================================================================
-# 4. AI REQUEST
-# ==============================================================================
-
-openai_request <- function(messages, model = DEFAULT_MODEL) {
-  api_key <- Sys.getenv("PORTKEY_API_KEY")
-  if (identical(api_key, "")) stop("PORTKEY_API_KEY not set")
-
-  body <- list(
+  req_body <- list(
     model = model,
     messages = messages,
     temperature = 0
   )
 
-  res <- POST(
-    url = PORTKEY_URL,
-    add_headers(
-      "x-portkey-api-key" = api_key,
-      "x-portkey-provider" = "anthropic",
-      "Content-Type" = "application/json"
-    ),
-    body = toJSON(body, auto_unbox = TRUE, null = "null"),
-    encode = "raw",
-    timeout(120)
-  )
-
-  stop_for_status(res)
-
-  raw_txt <- content(res, "text", encoding = "UTF-8")
-  out <- fromJSON(raw_txt, simplifyVector = FALSE)
-
-  if (!is.null(out$error)) {
-    stop(out$error$message %||% "API returned an unknown error")
+  if (!is.null(response_format)) {
+    req_body$response_format <- response_format
   }
 
-  if (is.null(out$choices) || length(out$choices) == 0) {
-    stop("No response choices returned from API")
+  res <- request(OPENAI_BASE) |>
+  req_headers(
+    "x-portkey-api-key" = Sys.getenv("PORTKEY_API_KEY"),
+    "x-portkey-virtual-key" = Sys.getenv("PORTKEY_VIRTUAL_KEY"),
+    "Content-Type" = "application/json"
+  ) |>
+    req_body_json(req_body) |>
+    req_retry(max_tries = 3) |>
+    req_perform() |>
+    resp_body_json()
+
+  if (is.null(res$choices) || length(res$choices) == 0) {
+    stop("No choices returned")
   }
 
-  out$choices[[1]]$message$content
+  res$choices[[1]]$message$content
 }
 
-ask_json <- function(prompt, model = DEFAULT_MODEL) {
-
+ask_json <- function(prompt, schema, model) {
   txt <- openai_request(
-    list(list(role = "user", content = paste(prompt, "\nReturn ONLY valid JSON. No explanation."))),
-    model = model
+    list(list(role = "user", content = prompt)),
+    model,
+    response_format = list(
+      type = "json_schema",
+      json_schema = list(name = "schema", schema = schema)
+    )
   )
-
-  # 🔥 JSON extract (çok kritik)
-  json_txt <- stringr::str_extract(txt, "\\{.*\\}")
-
-  if (is.na(json_txt)) {
-    return(list(level = "RED", reason = "no_json_returned", n = 0))
-  }
-
-  tryCatch(
-    fromJSON(json_txt, simplifyVector = FALSE),
-    error = function(e) {
-      list(level = "RED", reason = "parse_error", n = 0)
-    }
-  )
+  txt <- gsub("^```json\\s*|\\s*```$", "", txt)
+  fromJSON(txt, simplifyVector = FALSE)
 }
 
-# ==============================================================================
-# 5. PUBMED
-# ==============================================================================
+sanitize_colname <- function(x) {
+  x |>
+    toupper() |>
+    str_replace_all("[^A-Z0-9]+", "_") |>
+    str_replace_all("^_|_$", "")
+}
 
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+# ==============================================================================
+# 3. PUBMED FUNCTIONS
+# ==============================================================================
 search_pubmed <- function(query, retmax = 50, mindate = NULL, maxdate = NULL) {
   url <- "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-
-  q <- list(
-    db = "pubmed",
-    term = query,
-    retmode = "json",
-    retmax = retmax
-  )
-
-  if (!is.null(mindate) && !is.na(mindate)) q$mindate <- as.character(mindate)
-  if (!is.null(maxdate) && !is.na(maxdate)) q$maxdate <- as.character(maxdate)
-  if (!is.null(mindate) || !is.null(maxdate)) q$datetype <- "pdat"
-
-  res <- GET(url, query = q, timeout(60))
-  stop_for_status(res)
-
-  out <- fromJSON(content(res, "text", encoding = "UTF-8"), simplifyVector = FALSE)
-  out$esearchresult$idlist %||% character(0)
+  fmt_d <- function(d) if(!is.null(d)) format(as.Date(d), "%Y/%m/%d") else NULL
+  
+  req <- request(url) |>
+    req_url_query(
+      db = "pubmed",
+      term = query,
+      retmode = "json",
+      retmax = retmax,
+      datetype = "pdat",
+      mindate = fmt_d(mindate),
+      maxdate = fmt_d(maxdate)
+    )
+  
+  res <- req_perform(req) |> resp_body_json()
+  res$esearchresult$idlist %||% character(0)
 }
 
 fetch_pubmed <- function(ids) {
   if (length(ids) == 0) return(tibble())
-
+  
   url <- "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-
-  res <- GET(
-    url,
-    query = list(
-      db = "pubmed",
-      id = paste(ids, collapse = ","),
-      retmode = "xml"
-    ),
-    timeout(120)
-  )
-  stop_for_status(res)
-
-  doc <- read_xml(content(res, "text", encoding = "UTF-8"))
+  xml_str <- request(url) |>
+    req_url_query(db = "pubmed", id = paste(ids, collapse = ","), retmode = "xml") |>
+    req_perform() |>
+    resp_body_string()
+  
+  doc <- read_xml(xml_str)
   arts <- xml_find_all(doc, ".//PubmedArticle")
-
+  
   map_dfr(arts, function(a) {
+    abs_nodes <- xml_find_all(a, ".//AbstractText")
     tibble(
       pmid = xml_text(xml_find_first(a, ".//PMID")),
       title = xml_text(xml_find_first(a, ".//ArticleTitle")),
-      abstract = paste(xml_text(xml_find_all(a, ".//AbstractText")), collapse = " "),
+      abstract = paste(xml_text(abs_nodes), collapse = " "),
       journal = xml_text(xml_find_first(a, ".//Journal/Title")),
-      year = str_extract(
-        xml_text(xml_find_first(a, ".//PubDate")),
-        "\\d{4}"
-      )
+      year = str_extract(xml_text(xml_find_first(a, ".//PubDate")), "\\d{4}")
     )
-  }) %>%
-    mutate(
-      title = ifelse(is.na(title), "", title),
-      abstract = ifelse(is.na(abstract), "", abstract)
-    ) %>%
-    filter(abstract != "")
+  }) |> 
+    filter(!is.na(abstract), abstract != "")
 }
 
 # ==============================================================================
-# 6. TRIAGE
+# 4. EXCEL COLORING
 # ==============================================================================
-
-triage_one <- function(title, abstract, question, model = DEFAULT_MODEL) {
-  prompt <- paste0(
-    "You are a cardiology literature reviewer.\n\n",
-    "Research Question: ", question, "\n\n",
-    "Title: ", title, "\n\n",
-    "Abstract: ", abstract, "\n\n",
-    "Tasks:\n",
-    "1. Classify relevance:\n",
-    "   - GREEN = directly relevant clinical evidence\n",
-    "   - YELLOW = partially relevant or indirectly informative\n",
-    "   - RED = irrelevant\n",
-    "2. Extract study sample size if available.\n",
-    "3. Give a short reason.\n\n",
-    "Return JSON only in this exact structure:\n",
-    "{\"level\":\"GREEN or YELLOW or RED\",\"reason\":\"short text\",\"n\":0}"
-  )
-
-  res <- ask_json(prompt, model = model)
-
-  list(
-    relevance = res$level %||% "RED",
-    reason = res$reason %||% "",
-    n = suppressWarnings(as.numeric(res$n %||% 0))
-  )
-}
-
-# ==============================================================================
-# 7. EXCEL FORMAT
-# ==============================================================================
-
 apply_row_colors <- function(wb, sheet, df) {
-  if (!"relevance" %in% names(df) || nrow(df) == 0) return(invisible(NULL))
-
   green_style  <- createStyle(fgFill = "#C6EFCE")
   yellow_style <- createStyle(fgFill = "#FFEB9C")
   red_style    <- createStyle(fgFill = "#FFC7CE")
   header_style <- createStyle(textDecoration = "bold", fgFill = "#D9EAF7", border = "Bottom")
-
+  
   addStyle(wb, sheet, header_style, rows = 1, cols = 1:ncol(df), gridExpand = TRUE)
-
   for (i in seq_len(nrow(df))) {
     rel <- toupper(df$relevance[i] %||% "")
-    style <- switch(
-      rel,
-      "GREEN" = green_style,
-      "YELLOW" = yellow_style,
-      "RED" = red_style,
-      NULL
-    )
-    if (!is.null(style)) {
-      addStyle(wb, sheet, style, rows = i + 1, cols = 1:ncol(df), gridExpand = TRUE)
-    }
+    style <- switch(rel, GREEN = green_style, YELLOW = yellow_style, RED = red_style, NULL)
+    if (!is.null(style)) addStyle(wb, sheet, style, rows = i + 1, cols = 1:ncol(df), gridExpand = TRUE)
   }
 }
 
 # ==============================================================================
-# 8. UI
+# 5. QUERY MODE PROMPT BUILDER (OPTIMIZED FOR PRECISION)
 # ==============================================================================
+build_query_prompt <- function(question, mode) {
+  
+  mode_rules <- switch(
+    mode,
+    
+    "Focused" = "
+- Use MAX 2 synonyms per concept.
+- Prefer highly specific clinical terminology.
+- Strongly prioritize precision over recall.
+- Avoid MeSH explosion unless absolutely necessary.
+",
+    
+    "Balanced" = "
+- Use 3–4 synonyms per concept.
+- Combine MeSH and Title/Abstract terms.
+- Maintain balance between recall and precision.
+",
+    
+    "Broad" = "
+- Use multiple synonyms and include MeSH terms.
+- Allow broader semantic expansion.
+- Still enforce logical AND structure to avoid noise.
+",
+    
+    "Default" = "
+- Maintain clear concept separation and Boolean structure.
+"
+  )
+  
+  glue("
+You are a senior medical information specialist with expertise in PubMed query construction.
 
+Your task is to transform a clinical research question into a precise PubMed search query.
+
+---------------------
+STEP 1: CONCEPT IDENTIFICATION
+---------------------
+- Identify TWO core concepts:
+  1. Intervention / Exposure (e.g., TTVR, MitraClip, TAVR)
+  2. Population / Disease (e.g., tricuspid regurgitation, aortic stenosis)
+
+---------------------
+STEP 2: SYNONYM GENERATION
+---------------------
+- Generate controlled synonyms for each concept
+- Include:
+  - Full medical terms (no abbreviations like TR, MR)
+  - Device names + generic class if applicable
+    Example:
+      "Evoque" → also include "transcatheter tricuspid valve replacement"
+
+---------------------
+STEP 3: FIELD TAGGING
+---------------------
+- Use:
+  [Title/Abstract] for clinical terms
+  [MeSH Terms] only if highly relevant
+
+---------------------
+STEP 4: BOOLEAN STRUCTURE (MANDATORY)
+---------------------
+Final structure MUST be:
+
+(
+  Concept1_term1[Title/Abstract] OR Concept1_term2[Title/Abstract] ...
+)
+AND
+(
+  Concept2_term1[Title/Abstract] OR Concept2_term2[Title/Abstract] ...
+)
+
+---------------------
+STEP 5: NOISE CONTROL
+---------------------
+- DO NOT include:
+  outcomes, mortality, results, management
+- DO NOT include:
+  "human", "English", publication type filters
+- DO NOT include:
+  abbreviations like TR, MR, AS unless expanded
+
+---------------------
+STEP 6: MODE
+---------------------
+Current mode: {mode}
+{mode_rules}
+
+---------------------
+FINAL OUTPUT
+---------------------
+- Return ONLY the final PubMed query string
+- No explanation
+- No formatting text
+- No line breaks
+
+---------------------
+INPUT QUESTION
+---------------------
+{question}
+")
+}
+# ==============================================================================
+# 6. SHINY UI
+# ==============================================================================
 ui <- fluidPage(
   useShinyjs(),
   theme = shinythemes::shinytheme("cosmo"),
-
-  titlePanel("CardioLit AI"),
-
+  titlePanel(tags$div(tags$i(class="fa fa-heartbeat", style="color:red"), " CardioLit AI Pro")),
+  
   sidebarLayout(
     sidebarPanel(
-      textAreaInput("q", "Question", "TTVR outcomes for severe TR", rows = 3),
-      textAreaInput("o", "Outcomes", "Mortality, TR grade", rows = 2),
-      numericInput("retmax", "Abstracts", value = 20, min = 1, max = 200),
-      numericInput("min_n", "Minimum sample size", value = 30, min = 0, max = 100000),
-      actionButton("run", "Run", class = "btn-primary"),
+      textAreaInput("q", "Research Question", value = "TTVR outcomes for severe TR", rows = 3),
+      textAreaInput("o", "Outcomes (comma separated)", value = "Mortality, TR grade, NYHA class", rows = 2),
+      
+      selectInput(
+        "query_mode",
+        "Query Mode",
+        choices = c("Focused", "Balanced", "Broad"),
+        selected = "Focused"
+      ),
+      
+      splitLayout(
+        numericInput("retmax", "Max Abstracts", 20, 5, 200),
+        numericInput("min_n", "Min Sample (N)", 30, 0, 5000)
+      ),
+      
+      dateRangeInput("dates", "Date Range", start = Sys.Date() - 1825, end = Sys.Date()),
+      
+      hr(),
+      actionButton("run", "Start Review", class = "btn-primary", style="width:100%"),
       br(), br(),
-      downloadButton("download", "Download Excel")
+      downloadButton("download", "Download Excel", class = "btn-success", style="width:100%")
     ),
-
+    
     mainPanel(
       h4("System Log"),
-      verbatimTextOutput("log")
+      wellPanel(
+        style = "background: #f8f9fa; border: 1px solid #dee2e6;",
+        verbatimTextOutput("log")
+      )
     )
   )
 )
 
 # ==============================================================================
-# 9. SERVER
+# 7. SHINY SERVER
 # ==============================================================================
-
 server <- function(input, output, session) {
-  result_file <- reactiveVal(NULL)
-  log_text <- reactiveVal("Ready")
-
-  output$log <- renderText({
-    log_text()
-  })
-
+  res_val <- reactiveVal(NULL)
+  
   observeEvent(input$run, {
     disable("run")
-    log_text("Running...")
-
+    output$log <- renderText("Pipeline initiated...")
+    
     tryCatch({
-      ids <- search_pubmed(input$q, input$retmax)
-      df <- fetch_pubmed(ids)
-
-      if (nrow(df) == 0) stop("No abstracts found")
-
-      log_text(paste("Fetched", nrow(df), "abstracts. Running AI triage..."))
-
-      results <- vector("list", nrow(df))
-
-      for (i in seq_len(nrow(df))) {
-        log_text(paste("Processing", i, "/", nrow(df)))
-
-        if (is.na(df$abstract[i]) || trimws(df$abstract[i]) == "") {
-          results[[i]] <- df[i, ] %>%
-            mutate(
-              relevance = "RED",
-              sample_size = 0,
-              triage_reason = "no_abstract"
-            )
-          next
-        }
-
-        t <- tryCatch(
-          triage_one(df$title[i], df$abstract[i], input$q, model = DEFAULT_MODEL),
-          error = function(e) {
-            list(relevance = "RED", reason = "api_error", n = 0)
-          }
+      withProgress(message = 'Analyzing Cardiology Literature...', value = 0, {
+        
+        # 1. Query Generation
+        incProgress(0.1, detail = "Formulating PubMed Query...")
+        q_prompt <- build_query_prompt(input$q, input$query_mode)
+        q_raw <- openai_request(list(list(role = "user", content = q_prompt)), MODEL_TRIAGE)
+        q_final <- paste0("(", q_raw, ") AND hasabstract[text] NOT \"case reports\"[PT]")
+        
+        # 2. PubMed Search
+        incProgress(0.1, detail = "Searching PubMed Database...")
+        ids <- search_pubmed(q_final, input$retmax, input$dates[1], input$dates[2])
+        if (length(ids) == 0) stop("No records found for these criteria.")
+        df <- fetch_pubmed(ids)
+        if (nrow(df) == 0) stop("PubMed records bulundu ama abstract çekilemedi.")
+        
+        # 3. Triage
+        incProgress(0.1, detail = "Screening Abstracts...")
+        triage_schema <- list(
+          type = "object",
+          properties = list(
+            level = list(type = "string", enum = list("GREEN", "YELLOW", "RED")),
+            reason = list(type = "string"),
+            n = list(type = "integer")
+          ),
+          required = list("level", "reason", "n")
         )
+        
+        triage_list <- list()
+        for (i in seq_len(nrow(df))) {
+          incProgress(0.3 / nrow(df), detail = paste("Triage:", i, "/", nrow(df)))
+          
+          prompt <- glue("
+You are screening a PubMed abstract for a cardiology literature review.
 
-        results[[i]] <- df[i, ] %>%
-          mutate(
-            relevance = t$relevance %||% "RED",
-            sample_size = as.numeric(t$n %||% 0),
-            triage_reason = t$reason %||% ""
-          )
+Research question:
+{input$q}
 
-        Sys.sleep(0.2)
-      }
+Title:
+{df$title[i]}
 
-      df <- bind_rows(results) %>%
-        mutate(
-          sample_size = ifelse(is.na(sample_size), 0, sample_size),
-          relevance = case_when(
-            sample_size < input$min_n ~ "RED",
-            TRUE ~ relevance
-          )
-        )
+Abstract:
+{df$abstract[i]}
 
-      wb <- createWorkbook()
+You are a senior cardiology research reviewer performing abstract triage.
 
-      addWorksheet(wb, "Results")
-      writeData(wb, "Results", df)
-      apply_row_colors(wb, "Results", df)
+Research Question:
+{input$q}
 
-      addWorksheet(wb, "Parameters")
-      writeData(
-        wb, "Parameters",
-        tibble(
-          Field = c("Question", "Outcomes", "Abstracts Requested", "Minimum Sample Size", "Model"),
-          Value = c(input$q, input$o, input$retmax, input$min_n, DEFAULT_MODEL)
-        )
-      )
+Title:
+{title}
 
-      fname <- file.path(
-        tempdir(),
-        paste0("result_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx")
-      )
+Abstract:
+{abstract}
 
-      saveWorkbook(wb, fname, overwrite = TRUE)
-      result_file(fname)
+---------------------
+TRIAGE RULES (STRICT)
+---------------------
 
-      log_text("Completed with AI triage ✔")
+1. GREEN (High relevance)
+- Directly answers the research question
+- Contains clinical outcome data (e.g., mortality, rehospitalization, procedural success)
+- Human study with analyzable data
+- Includes quantitative results or clear clinical findings
 
-    }, error = function(e) {
-      log_text(paste("Error:", e$message))
-    })
+2. YELLOW (Partial relevance)
+- Related population or intervention but does NOT directly answer the question
+- Background, subgroup, mechanistic, or indirect evidence
+- Limited or unclear outcome reporting
 
-    enable("run")
-  })
+3. RED (Exclude)
+- Case reports or case series with N < 10
+- Editorials, reviews without original data
+- Animal or preclinical studies
+- Clearly unrelated topic
+- Imaging-only or technical feasibility without outcomes
 
-  output$download <- downloadHandler(
-    filename = function() {
-      paste0("CardioLit_Review_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xlsx")
-    },
-    content = function(file) {
-      req(result_file())
-      file.copy(result_file(), file, overwrite = TRUE)
-    }
-  )
+---------------------
+SAMPLE SIZE (CRITICAL)
+---------------------
+- Extract total study sample size (N)
+- If multiple groups exist → return TOTAL N
+- If unclear → return 0
+
+---------------------
+REASON
+---------------------
+- Provide ONE short reason (max 12 words)
+- Be specific (e.g., "Direct TTVR outcome study", "Review article", "Small case series")
+
+---------------------
+ANTI-HALLUCINATION
+---------------------
+- DO NOT guess sample size
+- DO NOT infer relevance beyond text
+- If uncertain → downgrade (prefer YELLOW over GREEN)
+
+---------------------
+OUTPUT (JSON ONLY)
+---------------------
+
+{
+  "level": "GREEN | YELLOW | RED",
+  "reason": "short reason",
+  "n": 123
 }
 
-# ==============================================================================
-# 10. RUN APP
-# ==============================================================================
+Return JSON with:
+- level
+- reason
+- n
+")
+          
+          t_res <- ask_json(prompt, triage_schema, MODEL_TRIAGE)
+          
+          rel <- t_res$level
+          reas <- t_res$reason
+          if (t_res$n < input$min_n) {
+            rel <- "RED"
+            reas <- paste0("Small sample (N=", t_res$n, ")")
+          }
+          
+          triage_list[[i]] <- df[i, ] %>% 
+            mutate(
+              relevance = rel,
+              triage_reason = reas,
+              sample_size = t_res$n
+            )
+        }
+        triage_df <- bind_rows(triage_list)
+        
+        # 4. Extraction
+        incProgress(0.1, detail = "Extracting Outcomes...")
+        eligible_df <- triage_df %>% filter(relevance %in% c("GREEN", "YELLOW"))
+        outcomes_list <- trimws(strsplit(input$o, ",")[[1]])
+        
+        if (nrow(eligible_df) > 0) {
+          extract_schema <- list(
+            type = "object",
+            properties = list(
+              outcomes = list(
+                type = "array",
+                items = list(
+                  type = "object",
+                  properties = list(
+                    name = list(type = "string"),
+                    rate = list(type = "string"),
+                    timepoint = list(type = "string"),
+                    text = list(type = "string")
+                  ),
+                  required = list("name", "rate", "timepoint", "text")
+                )
+              )
+            ),
+            required = list("outcomes")
+          )
+          
+          final_rows <- list()
+          for (j in seq_len(nrow(eligible_df))) {
+            incProgress(0.3 / nrow(eligible_df), detail = paste("Extracting:", j, "/", nrow(eligible_df)))
+            
+            e_prompt <- glue("
+Extract outcome data from this cardiology abstract.
+
+Requested outcomes:
+{input$o}
+
+You are an expert clinical data extractor in cardiology.
+
+Your task is to extract structured outcome data from a PubMed abstract.
+
+REQUESTED OUTCOMES:
+{input$o}
+
+ABSTRACT:
+{abstract}
+
+---------------------
+EXTRACTION RULES
+---------------------
+
+1. OUTCOME MATCHING
+- Treat the requested outcomes strictly as user-defined labels.
+- Match outcomes semantically (not just exact wording).
+  Example:
+  "all-cause mortality" ≈ "mortality"
+  "TR reduction" ≈ "tricuspid regurgitation grade"
+
+2. MULTIPLE RESULTS
+- If multiple values exist for the same outcome (e.g., 30-day and 1-year mortality):
+  → return the MOST clinically relevant OR longest follow-up.
+- Prefer:
+  1-year > 6 months > 30 days > in-hospital
+
+3. NUMERIC EXTRACTION PRIORITY
+Extract the MOST important metric available:
+- Percent (%)
+- Hazard ratio (HR)
+- Odds ratio (OR)
+- Mean/median values
+- Event rates
+
+If multiple metrics exist → prefer % or HR
+
+4. TIMEPOINT EXTRACTION
+Extract exact timepoint:
+Examples:
+- in-hospital
+- discharge
+- 30 days
+- 6 months
+- 1 year
+- follow-up
+
+If not stated → "NA"
+
+5. MISSING DATA HANDLING
+- Outcome mentioned but no number → "reported_no_numeric_value"
+- Outcome absent → "NA"
+
+6. STRICT ANTI-HALLUCINATION
+- DO NOT infer or guess numbers
+- DO NOT fabricate outcomes
+- ONLY extract what is explicitly present
+
+7. TEXT SNIPPET
+- Provide a SHORT exact snippet from the abstract supporting the value
+- Max 20 words
+- No paraphrasing if possible
+
+8. OUTPUT CONSISTENCY
+- Always return ALL requested outcomes
+- Preserve requested naming as much as possible
+
+---------------------
+OUTPUT FORMAT (JSON ONLY)
+---------------------
+
+{
+  "outcomes": [
+    {
+      "name": "Mortality",
+      "rate": "12%",
+      "timepoint": "1 year",
+      "metric_type": "percentage",
+      "confidence": "high",
+      "text": "1-year mortality was 12% in the TTVR group"
+    }
+  ]
+}
+
+Abstract:
+{eligible_df$abstract[j]}
+")
+            
+            e_res <- ask_json(e_prompt, extract_schema, MODEL_EXTRACT)
+            
+            row <- eligible_df[j, ]
+            for (oc in outcomes_list) {
+              match <- detect(e_res$outcomes, ~ sanitize_colname(.x$name) == sanitize_colname(oc))
+              row[[paste0(sanitize_colname(oc), "_RATE")]] <- if (!is.null(match)) match$rate else "NA"
+              row[[paste0(sanitize_colname(oc), "_TIMEPOINT")]] <- if (!is.null(match)) match$timepoint else "NA"
+              row[[paste0(sanitize_colname(oc), "_TEXT")]] <- if (!is.null(match)) match$text else "NA"
+            }
+            final_rows[[j]] <- row
+          }
+          final_df <- bind_rows(final_rows)
+        } else {
+          final_df <- triage_df[0, ]
+        }
+        
+        # 5. Excel Generation
+        incProgress(0.1, detail = "Saving Excel...")
+        wb <- createWorkbook()
+        
+        addWorksheet(wb, "Parameters")
+        writeData(
+          wb, "Parameters",
+          tibble(
+            Field = c("Question", "Query_Mode", "Query", "Min_N", "Requested_Outcomes"),
+            Value = c(input$q, input$query_mode, q_final, input$min_n, input$o)
+          )
+        )
+        
+        addWorksheet(wb, "Triage_All")
+        writeData(wb, "Triage_All", triage_df)
+        apply_row_colors(wb, "Triage_All", triage_df)
+        
+        addWorksheet(wb, "Final_Data")
+        writeData(wb, "Final_Data", final_df)
+        if (nrow(final_df) > 0) apply_row_colors(wb, "Final_Data", final_df)
+        
+        fname <- paste0("CardioLit_Review_", format(Sys.time(), "%Y%m%d_%H%M"), ".xlsx")
+        saveWorkbook(wb, fname, overwrite = TRUE)
+        res_val(fname)
+        
+        output$log <- renderText(
+          paste0(
+            "Success! Processed ", nrow(df), " abstracts.\n\n",
+            "Query mode: ", input$query_mode, "\n\n",
+            "Final Query:\n", q_final, "\n\n",
+            "Saved file: ", fname
+          )
+        )
+      })
+    }, error = function(e) {
+      output$log <- renderText(paste("Error:", e$message))
+    })
+    
+    enable("run")
+  })
+  
+  output$download <- downloadHandler(
+    filename = function() res_val(),
+    content = function(file) file.copy(res_val(), file)
+  )
+}
 
 shinyApp(ui, server)
